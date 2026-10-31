@@ -1,0 +1,45 @@
+{
+  "pkgId": "top.morenrx.highfps",
+  "name": "HighFPS",
+  "author": "MorenRx",
+  "brieflyDescribe": "高帧率支持与运动插值模组",
+  "description": "高帧率与运动插值模组。\n支持 30 / 60 / 90 / 120 / 144 / 240 帧率档位，同时保持游戏每秒 60 次固定逻辑 Tick。",
+  "version": "1.0.0",
+  "versionCode": 1,
+  "targetGameVersion": "1.4.5",
+  "minGameVersion": "1.4.4",
+  "maxGameVersion": "1.4.6",
+  "features": [
+    "VISUAL_ENHANCEMENT"
+  ],
+  "sizeCategory": "SMALL",
+  "stableVerified": true,
+  "experimental": false,
+  "deprecated": false,
+  "hasExtendedContent": false,
+  "detailsURL": "https://github.com/MorenRx/TEFMod_HighFPS",
+  "dependence": [],
+  "conflicts": [],
+  "support": {
+    "android": {
+      "arm64": true,
+      "arm": false
+    },
+    "windows": {
+      "x64": false,
+      "x86": false
+    },
+    "linux": {
+      "x64": false,
+      "x86": false
+    },
+    "mac": {
+      "x64": false,
+      "arm64": false
+    },
+    "ios": {
+      "arm64": false
+    }
+  },
+  "settings": []
+}
