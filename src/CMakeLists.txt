@@ -6,12 +6,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Add shared library
 add_library(highfps SHARED
-    src/main.cpp
-    src/log.cpp
-    src/config.cpp
-    src/timing.cpp
-    src/ui.cpp
-    src/interpolation.cpp
+    cpp/main.cpp
+    cpp/log.cpp
+    cpp/config.cpp
+    cpp/timing.cpp
+    cpp/ui.cpp
+    cpp/interpolation.cpp
     external/TEFKernel/include/tef_api_imp.c
 )
 
@@ -24,7 +24,7 @@ set_target_properties(highfps PROPERTIES
 
 # Include directories
 target_include_directories(highfps PRIVATE
-    src
+    cpp
     includes
     external/TEFKernel/include
 )

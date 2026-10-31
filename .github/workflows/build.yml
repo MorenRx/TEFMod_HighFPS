@@ -1,0 +1,66 @@
+name: Build HighFPS
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-android-arm64:
+    name: Build Android ARM64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+          add-to-path: true
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build zip
+
+      - name: Configure CMake
+        run: |
+          cmake -B build_release -S src \
+            -DCMAKE_TOOLCHAIN_FILE="${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="arm64-v8a" \
+            -DANDROID_PLATFORM="android-28" \
+            -DCMAKE_BUILD_TYPE="Release" \
+            -GNinja
+
+      - name: Build with Ninja
+        run: |
+          cmake --build build_release
+
+      - name: Strip debug symbols
+        run: |
+          ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip --strip-all build_release/libhighfps.android.arm64.so
+
+      - name: Package Mod Archive
+        run: |
+          mkdir -p dist/top.morenrx.highfps/resources/lib
+          cp build_release/libhighfps.android.arm64.so dist/top.morenrx.highfps/resources/lib/
+          cp src/modinfo/Info.json src/modinfo/Manifest.json src/modinfo/mod.json dist/top.morenrx.highfps/
+          cd dist/top.morenrx.highfps
+          zip -r ../HighFPS_TEFKL_android_arm64.zip Info.json Manifest.json mod.json resources/
+          cd ../..
+          rm -rf dist/top.morenrx.highfps
+
+      - name: Upload Artifact to Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: HighFPS_TEFKL_android_arm64
+          path: dist/HighFPS_TEFKL_android_arm64.zip
+          if-no-files-found: error

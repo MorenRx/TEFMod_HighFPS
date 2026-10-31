@@ -1,9 +1,9 @@
 # HighFPS Build & Package Script
 Param (
     [string]$BuildType = "Release",
-    [string]$NdkPath = "D:\Package\AndroidSDK\ndk\26.1.10909125",
-    [string]$CmakePath = "D:\Package\AndroidSDK\cmake\3.31.6\bin\cmake.exe",
-    [string]$NinjaPath = "D:\Package\AndroidSDK\cmake\3.31.6\bin\ninja.exe"
+    [string]$NdkPath = "",
+    [string]$CmakePath = "",
+    [string]$NinjaPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,22 +15,78 @@ Write-Host "==========================================" -ForegroundColor Cyan
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 Set-Location $ScriptDir
 
+# 0. Auto-detect Android NDK
+if (-not $NdkPath) {
+    $PotentialNdkPaths = @(
+        $env:ANDROID_NDK_HOME,
+        $env:ANDROID_NDK_ROOT,
+        $env:NDK_HOME,
+        "D:\Package\AndroidSDK\ndk\26.1.10909125"
+    )
+    if ($env:ANDROID_HOME -and (Test-Path "$env:ANDROID_HOME\ndk")) {
+        $LatestNdk = Get-ChildItem "$env:ANDROID_HOME\ndk" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+        if ($LatestNdk) { $PotentialNdkPaths += $LatestNdk.FullName }
+    }
+    if ($env:LOCALAPPDATA -and (Test-Path "$env:LOCALAPPDATA\Android\Sdk\ndk")) {
+        $LatestNdk = Get-ChildItem "$env:LOCALAPPDATA\Android\Sdk\ndk" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+        if ($LatestNdk) { $PotentialNdkPaths += $LatestNdk.FullName }
+    }
+
+    foreach ($Candidate in $PotentialNdkPaths) {
+        if ($Candidate -and (Test-Path (Join-Path $Candidate "build/cmake/android.toolchain.cmake"))) {
+            $NdkPath = $Candidate
+            break
+        }
+    }
+}
+
+if (-not $NdkPath -or -not (Test-Path (Join-Path $NdkPath "build/cmake/android.toolchain.cmake"))) {
+    Write-Error "Android NDK toolchain not found! Please set ANDROID_NDK_HOME or pass -NdkPath <path>."
+}
+Write-Host "Using Android NDK: $NdkPath" -ForegroundColor Gray
+
+# Auto-detect CMake & Ninja
+if (-not $CmakePath) {
+    $CmakeCmd = Get-Command "cmake" -ErrorAction SilentlyContinue
+    if ($CmakeCmd) {
+        $CmakePath = $CmakeCmd.Source
+    } elseif (Test-Path "D:\Package\AndroidSDK\cmake\3.31.6\bin\cmake.exe") {
+        $CmakePath = "D:\Package\AndroidSDK\cmake\3.31.6\bin\cmake.exe"
+    } else {
+        $CmakePath = "cmake"
+    }
+}
+
+if (-not $NinjaPath) {
+    $NinjaCmd = Get-Command "ninja" -ErrorAction SilentlyContinue
+    if ($NinjaCmd) {
+        $NinjaPath = $NinjaCmd.Source
+    } elseif (Test-Path "D:\Package\AndroidSDK\cmake\3.31.6\bin\ninja.exe") {
+        $NinjaPath = "D:\Package\AndroidSDK\cmake\3.31.6\bin\ninja.exe"
+    }
+}
+
 # Check NDK toolchain
 $ToolchainFile = Join-Path $NdkPath "build/cmake/android.toolchain.cmake"
-if (-not (Test-Path $ToolchainFile)) {
-    Write-Error "Android NDK toolchain file not found at: $ToolchainFile"
-}
 
 # 1. CMake Configure
 $BuildDir = "build_$($BuildType.ToLower())"
 Write-Host "[1/3] Configuring with CMake ($BuildType)..." -ForegroundColor Yellow
-& $CmakePath -B $BuildDir -S . `
-    -DCMAKE_TOOLCHAIN_FILE="$ToolchainFile" `
-    -DANDROID_ABI="arm64-v8a" `
-    -DANDROID_PLATFORM="android-28" `
-    -DCMAKE_BUILD_TYPE="$BuildType" `
-    -GNinja `
-    -DCMAKE_MAKE_PROGRAM="$NinjaPath"
+
+$CmakeArgs = @(
+    "-B", $BuildDir,
+    "-S", "src",
+    "-DCMAKE_TOOLCHAIN_FILE=$ToolchainFile",
+    "-DANDROID_ABI=arm64-v8a",
+    "-DANDROID_PLATFORM=android-28",
+    "-DCMAKE_BUILD_TYPE=$BuildType",
+    "-GNinja"
+)
+if ($NinjaPath) {
+    $CmakeArgs += "-DCMAKE_MAKE_PROGRAM=$NinjaPath"
+}
+
+& $CmakePath @CmakeArgs
 
 # 2. CMake Build
 Write-Host "[2/3] Building target with Ninja..." -ForegroundColor Yellow
@@ -41,8 +97,14 @@ if ($LASTEXITCODE -ne 0) {
 
 # Strip release binary
 $BinaryPath = "$BuildDir/libhighfps.android.arm64.so"
-$StripExe = Join-Path $NdkPath "toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-strip.exe"
-if ($BuildType -eq "Release" -and (Test-Path $StripExe)) {
+$StripCandidates = @(
+    (Join-Path $NdkPath "toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-strip.exe"),
+    (Join-Path $NdkPath "toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"),
+    (Join-Path $NdkPath "toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip")
+)
+$StripExe = $StripCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+if ($BuildType -eq "Release" -and $StripExe) {
     Write-Host "      Stripping debug symbols..." -ForegroundColor Yellow
     & $StripExe --strip-all $BinaryPath
 }
@@ -67,9 +129,9 @@ New-Item -ItemType Directory -Force -Path "$DistModDir/resources/lib" | Out-Null
 
 # Files for TEFManager import
 Copy-Item -Path $BinaryPath -Destination "$DistModDir/resources/lib/" -Force
-Copy-Item -Path "Info.json" -Destination "$DistModDir/" -Force
-Copy-Item -Path "Manifest.json" -Destination "$DistModDir/" -Force
-Copy-Item -Path "mod.json" -Destination "$DistModDir/" -Force
+Copy-Item -Path "src/modinfo/Info.json" -Destination "$DistModDir/" -Force
+Copy-Item -Path "src/modinfo/Manifest.json" -Destination "$DistModDir/" -Force
+Copy-Item -Path "src/modinfo/mod.json" -Destination "$DistModDir/" -Force
 
 # Create zip with forward slash separators for TEFManager import
 $DistPath = (Resolve-Path "dist").Path
