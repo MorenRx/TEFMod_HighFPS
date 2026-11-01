@@ -6,8 +6,8 @@
 namespace HighFPS {
 
 struct ModConfig {
-    static constexpr int FPS_OPTIONS[] = { 30, 60, 90, 120, 144, 240 };
-    static constexpr const char* FPS_LABELS[] = { "30 FPS", "60 FPS", "90 FPS", "120 FPS", "144 FPS", "240 FPS" };
+    static constexpr int FPS_OPTIONS[] = { 30, 60, 120, 240 };
+    static constexpr const char* FPS_LABELS[] = { "30 FPS", "60 FPS", "120 FPS", "240 FPS" };
     static constexpr int FPS_COUNT = sizeof(FPS_OPTIONS) / sizeof(FPS_OPTIONS[0]);
 
     int target_fps = 60;

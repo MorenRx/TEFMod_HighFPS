@@ -16,7 +16,8 @@ void ModConfig::init(const std::string& private_dir) {
 }
 
 void ModConfig::load() {
-    if (!config_path.empty() && std::filesystem::exists(config_path)) {
+    std::error_code ec;
+    if (!config_path.empty() && std::filesystem::exists(config_path, ec) && !ec) {
         try {
             std::ifstream file(config_path);
             if (file.is_open()) {
@@ -64,7 +65,8 @@ void ModConfig::save() {
 
         std::filesystem::path p(config_path);
         if (p.has_parent_path()) {
-            std::filesystem::create_directories(p.parent_path());
+            std::error_code ec;
+            std::filesystem::create_directories(p.parent_path(), ec);
         }
 
         std::ofstream file(config_path);

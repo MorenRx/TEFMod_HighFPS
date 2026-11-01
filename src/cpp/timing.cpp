@@ -4,8 +4,6 @@
 #include "log.hpp"
 #include "patchlib/field.h"
 #include "patchlib/method.h"
-#include "memdl/memdl.h"
-
 #include <dlfcn.h>
 #include <elf.h>
 #include <cmath>
@@ -19,14 +17,12 @@ patch_handle_t TimingManager::s_main_type = PATCH_NULL;
 patch_handle_t TimingManager::s_game_type = PATCH_NULL;
 patch_handle_t TimingManager::s_app_type = PATCH_NULL;
 patch_handle_t TimingManager::s_runner_type = PATCH_NULL;
-patch_handle_t TimingManager::s_qs_type = PATCH_NULL;
 
 patch_handle_t TimingManager::s_set_target_fps_method = PATCH_NULL;
-patch_handle_t TimingManager::s_get_target_fps_method = PATCH_NULL;
-patch_handle_t TimingManager::s_set_vsync_method = PATCH_NULL;
-patch_handle_t TimingManager::s_get_vsync_method = PATCH_NULL;
 
 patch_handle_t TimingManager::s_runner_inst_field = PATCH_NULL;
+patch_handle_t TimingManager::s_runner_game_field = PATCH_NULL;
+patch_handle_t TimingManager::s_main_instance_field = PATCH_NULL;
 patch_handle_t TimingManager::s_set_surface_rate_method = PATCH_NULL;
 patch_handle_t TimingManager::s_apply_surface_rate_method = PATCH_NULL;
 patch_handle_t TimingManager::s_game_paused_field = PATCH_NULL;
@@ -40,33 +36,34 @@ typedef void* (*il2cpp_resolve_icall_fn)(const char* name);
 static il2cpp_resolve_icall_fn s_il2cpp_resolve_icall = nullptr;
 
 typedef void (*set_targetFrameRate_fn)(int);
-typedef int (*get_targetFrameRate_fn)();
-typedef void (*set_vSyncCount_fn)(int);
-typedef int (*get_vSyncCount_fn)();
-
 static set_targetFrameRate_fn s_set_fps_icall = nullptr;
-static get_targetFrameRate_fn s_get_fps_icall = nullptr;
-static set_vSyncCount_fn s_set_vsync_icall = nullptr;
-static get_vSyncCount_fn s_get_vsync_icall = nullptr;
 
 static uint32_t s_frame_check_counter = 0;
 static int s_last_enforced_fps = 0;
+static bool s_initial_fps_applied = false;
 
 // Safe in-memory ELF symbol scanner for libil2cpp.so
 static void* elf_find_symbol_in_memory(uintptr_t base_addr, const char* sym_name) {
-    if (!base_addr) return nullptr;
+    if (!base_addr || !sym_name) return nullptr;
     auto* ehdr = reinterpret_cast<const Elf64_Ehdr*>(base_addr);
     if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) return nullptr;
 
     auto* phdr = reinterpret_cast<const Elf64_Phdr*>(base_addr + ehdr->e_phoff);
-    const Elf64_Dyn* dynamic = nullptr;
+    uintptr_t min_vaddr = UINTPTR_MAX;
+    uintptr_t dynamic_vaddr = 0;
     for (size_t i = 0; i < ehdr->e_phnum; ++i) {
-        if (phdr[i].p_type == PT_DYNAMIC) {
-            dynamic = reinterpret_cast<const Elf64_Dyn*>(base_addr + phdr[i].p_vaddr);
-            break;
+        if (phdr[i].p_type == PT_LOAD) {
+            if (phdr[i].p_vaddr < min_vaddr) {
+                min_vaddr = phdr[i].p_vaddr;
+            }
+        } else if (phdr[i].p_type == PT_DYNAMIC) {
+            dynamic_vaddr = phdr[i].p_vaddr;
         }
     }
-    if (!dynamic) return nullptr;
+    if (!dynamic_vaddr) return nullptr;
+
+    uintptr_t load_bias = (min_vaddr != UINTPTR_MAX) ? (base_addr - min_vaddr) : base_addr;
+    const auto* dynamic = reinterpret_cast<const Elf64_Dyn*>(load_bias + dynamic_vaddr);
 
     const char* strtab = nullptr;
     const Elf64_Sym* symtab = nullptr;
@@ -77,40 +74,68 @@ static void* elf_find_symbol_in_memory(uintptr_t base_addr, const char* sym_name
         if (d->d_tag == DT_STRTAB) {
             uintptr_t ptr = d->d_un.d_ptr;
             strtab = (ptr >= base_addr) ? reinterpret_cast<const char*>(ptr)
-                                        : reinterpret_cast<const char*>(base_addr + ptr);
+                                        : reinterpret_cast<const char*>(load_bias + ptr);
         } else if (d->d_tag == DT_SYMTAB) {
             uintptr_t ptr = d->d_un.d_ptr;
             symtab = (ptr >= base_addr) ? reinterpret_cast<const Elf64_Sym*>(ptr)
-                                        : reinterpret_cast<const Elf64_Sym*>(base_addr + ptr);
+                                        : reinterpret_cast<const Elf64_Sym*>(load_bias + ptr);
         } else if (d->d_tag == DT_STRSZ) {
             strsz = d->d_un.d_val;
         } else if (d->d_tag == DT_HASH) {
             uintptr_t ptr = d->d_un.d_ptr;
             const uint32_t* hash = (ptr >= base_addr) ? reinterpret_cast<const uint32_t*>(ptr)
-                                                      : reinterpret_cast<const uint32_t*>(base_addr + ptr);
+                                                      : reinterpret_cast<const uint32_t*>(load_bias + ptr);
             if (hash) {
                 sym_count = hash[1]; // nchain in sysv hash table
+            }
+        } else if (d->d_tag == DT_GNU_HASH) {
+            uintptr_t ptr = d->d_un.d_ptr;
+            const uint32_t* gnu_hash = (ptr >= base_addr) ? reinterpret_cast<const uint32_t*>(ptr)
+                                                          : reinterpret_cast<const uint32_t*>(load_bias + ptr);
+            if (gnu_hash) {
+                uint32_t nbuckets = gnu_hash[0];
+                uint32_t symoffset = gnu_hash[1];
+                uint32_t bloom_size = gnu_hash[2];
+                // In 64-bit ELF, bloom filter entries are Elf64_Addr (8 bytes each = 2 * uint32_t)
+                const uint32_t* buckets = gnu_hash + 4 + (bloom_size * 2);
+                uint32_t max_chain_idx = 0;
+                for (uint32_t b = 0; b < nbuckets; ++b) {
+                    if (buckets[b] > max_chain_idx) {
+                        max_chain_idx = buckets[b];
+                    }
+                }
+                if (max_chain_idx >= symoffset) {
+                    const uint32_t* chains = buckets + nbuckets;
+                    uint32_t cur = max_chain_idx;
+                    while (cur < 500000) {
+                        uint32_t hashval = chains[cur - symoffset];
+                        cur++;
+                        if (hashval & 1) break; // End of chain marker
+                    }
+                    if (cur > sym_count) sym_count = cur;
+                }
             }
         }
     }
 
     if (!strtab || !symtab || strsz == 0) return nullptr;
-    if (sym_count == 0 || sym_count > 100000) {
-        sym_count = 10000;
+    if (sym_count == 0 || sym_count > 1000000) {
+        sym_count = 50000;
     }
 
     for (size_t i = 0; i < sym_count; ++i) {
+        if (symtab[i].st_value == 0) continue; // Undefined / imported symbol
         uint32_t name_idx = symtab[i].st_name;
         if (name_idx >= strsz) continue;
         const char* name = strtab + name_idx;
         if (name && strcmp(name, sym_name) == 0) {
-            return reinterpret_cast<void*>(base_addr + symtab[i].st_value);
+            return reinterpret_cast<void*>(load_bias + symtab[i].st_value);
         }
     }
     return nullptr;
 }
 
-// Find symbol in libil2cpp.so across namespace boundaries
+// Find symbol in libil2cpp.so across namespace boundaries safely
 void* find_il2cpp_symbol(const char* sym_name) {
     if (!sym_name) return nullptr;
 
@@ -121,79 +146,53 @@ void* find_il2cpp_symbol(const char* sym_name) {
         return sym;
     }
 
-    // 2. Try dlopen by soname
+    // 2. Try dlopen by soname with RTLD_NOLOAD only
+    // NEVER use RTLD_NOW here as it will force loading a duplicate copy into the mod namespace
     void* handle = dlopen("libil2cpp.so", RTLD_NOLOAD);
-    if (!handle) {
-        handle = dlopen("libil2cpp.so", RTLD_NOW);
-    }
     if (handle) {
         sym = dlsym(handle, sym_name);
         if (sym) {
-            LOGI("Found %s via dlopen(\"libil2cpp.so\"): %p", sym_name, sym);
+            LOGI("Found %s via dlopen(\"libil2cpp.so\", RTLD_NOLOAD): %p", sym_name, sym);
             return sym;
         }
     }
 
-    // 3. Scan /proc/self/maps for libil2cpp.so path and base address
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (fp) {
-        char line[512];
-        char il2cpp_path[256] = {0};
-        uintptr_t base_addr = 0;
-
-        while (fgets(line, sizeof(line), fp)) {
-            if (strstr(line, "libil2cpp.so")) {
-                if (base_addr == 0) {
-                    uintptr_t start = 0, end = 0;
-                    if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
-                        base_addr = start;
-                    }
-                }
-                char* path = strchr(line, '/');
-                if (path && il2cpp_path[0] == '\0') {
-                    size_t len = strlen(path);
-                    while (len > 0 && (path[len - 1] == '\n' || path[len - 1] == '\r')) {
-                        path[--len] = '\0';
-                    }
-                    if (len < sizeof(il2cpp_path)) {
-                        strncpy(il2cpp_path, path, sizeof(il2cpp_path) - 1);
+    // 3. Scan /proc/self/maps for the existing libil2cpp.so base address and resolve directly from memory.
+    // In isolated linker namespaces (e.g., Root / LSPosed clns-9), dlopen(..., RTLD_NOW) creates an uninitialized
+    // duplicate libil2cpp.so copy whose GC handle table is uninitialized, causing silent game crash on Locale zh-CN.
+    // Resolving directly against the already-initialized memory image prevents duplicate instances.
+    static uintptr_t s_cached_il2cpp_base = 0;
+    static bool s_searched_maps = false;
+    if (!s_cached_il2cpp_base && !s_searched_maps) {
+        s_searched_maps = true;
+        FILE* fp = fopen("/proc/self/maps", "r");
+        if (fp) {
+            char line[512];
+            while (fgets(line, sizeof(line), fp)) {
+                if (strstr(line, "libil2cpp.so")) {
+                    char perms[8] = {0};
+                    uintptr_t start = 0, end = 0, offset = 0;
+                    if (sscanf(line, "%lx-%lx %7s %lx", &start, &end, perms, &offset) == 4) {
+                        if (offset == 0 && perms[0] == 'r') {
+                            auto* ehdr = reinterpret_cast<const Elf64_Ehdr*>(start);
+                            if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) == 0) {
+                                s_cached_il2cpp_base = start;
+                                break;
+                            }
+                        }
                     }
                 }
             }
+            fclose(fp);
         }
-        fclose(fp);
+    }
 
-        if (il2cpp_path[0]) {
-            LOGI("Found libil2cpp.so in maps: %s (base=%p)", il2cpp_path, reinterpret_cast<void*>(base_addr));
-
-            handle = dlopen(il2cpp_path, RTLD_NOLOAD);
-            if (!handle) handle = dlopen(il2cpp_path, RTLD_NOW);
-            if (handle) {
-                sym = dlsym(handle, sym_name);
-                if (sym) {
-                    LOGI("Found %s via dlopen(full_path): %p", sym_name, sym);
-                    return sym;
-                }
-            }
-
-            if (memdl_open_file && memdl_sym) {
-                memdl_handle_t mhandle = memdl_open_file(il2cpp_path, MEMDL_NOW);
-                if (mhandle) {
-                    sym = memdl_sym(mhandle, sym_name);
-                    if (sym) {
-                        LOGI("Found %s via memdl_open_file: %p", sym_name, sym);
-                        return sym;
-                    }
-                }
-            }
-        }
-
-        if (base_addr) {
-            sym = elf_find_symbol_in_memory(base_addr, sym_name);
-            if (sym) {
-                LOGI("Found %s via memory ELF scan: %p", sym_name, sym);
-                return sym;
-            }
+    if (s_cached_il2cpp_base) {
+        LOGI("Found libil2cpp.so base in maps: %p", reinterpret_cast<void*>(s_cached_il2cpp_base));
+        sym = elf_find_symbol_in_memory(s_cached_il2cpp_base, sym_name);
+        if (sym) {
+            LOGI("Found %s via memory ELF scan: %p", sym_name, sym);
+            return sym;
         }
     }
 
@@ -201,18 +200,25 @@ void* find_il2cpp_symbol(const char* sym_name) {
     return nullptr;
 }
 
-static void set_vsync_zero() {
-    if (s_set_vsync_icall) {
-        s_set_vsync_icall(0);
+static patch_handle_t s_cached_runner_inst = PATCH_NULL;
+static patch_handle_t s_cached_game_inst = PATCH_NULL;
+
+static inline patch_handle_t get_runner_inst() {
+    if (s_cached_runner_inst == PATCH_NULL && TimingManager::s_runner_inst_field) {
+        patchlib_field_get_value(TimingManager::s_runner_inst_field, PATCH_NULL, &s_cached_runner_inst);
     }
-    if (TimingManager::s_set_vsync_method) {
-        int zero = 0;
-        void* args[] = { &zero };
-        patchlib_method_invoke_args(TimingManager::s_set_vsync_method, PATCH_NULL, nullptr, args);
-    }
+    return s_cached_runner_inst;
 }
 
 static void set_target_framerate(int fps) {
+    if (!s_set_fps_icall && s_il2cpp_resolve_icall) {
+        s_set_fps_icall = reinterpret_cast<set_targetFrameRate_fn>(
+            s_il2cpp_resolve_icall("UnityEngine.Application::set_targetFrameRate(System.Int32)"));
+        if (!s_set_fps_icall) {
+            s_set_fps_icall = reinterpret_cast<set_targetFrameRate_fn>(
+                s_il2cpp_resolve_icall("UnityEngine.Application::set_targetFrameRate"));
+        }
+    }
     if (s_set_fps_icall) {
         s_set_fps_icall(fps);
     }
@@ -223,32 +229,29 @@ static void set_target_framerate(int fps) {
     }
 }
 
-static patch_handle_t s_cached_runner_inst = PATCH_NULL;
-static inline patch_handle_t get_runner_inst() {
-    if (s_cached_runner_inst == PATCH_NULL && TimingManager::s_runner_inst_field) {
-        patchlib_field_get_value(TimingManager::s_runner_inst_field, PATCH_NULL, &s_cached_runner_inst);
-    }
-    return s_cached_runner_inst;
-}
-
 // 1. Hook Game.UnityUpdate to enforce decoupled 60 TPS accumulator logic every frame
 static bool hook_Game_UnityUpdate_prefix(patch_handle_t instance, void** args,
                                          const patch_method_signature_t* sig_info, void* result) {
-    // Crucial: enforce runner DisableVariableUpdate = false and PendingTargetSurfaceRate = false
-    // Game.UnityUpdate checks runner.DisableVariableUpdate at 0xE9E9EC BEFORE checking updateModeVariable!
+    if (instance != PATCH_NULL) {
+        s_cached_game_inst = instance;
+    }
+
+    // First frame fallback check if Awake didn't trigger apply_target_fps
+    if (!s_initial_fps_applied) {
+        LOGI("Game.UnityUpdate first-frame fallback -> applying target FPS: %d", g_config.target_fps);
+        s_initial_fps_applied = true;
+        TimingManager::apply_target_fps(g_config.target_fps);
+    }
+
+    // Enforce runner DisableVariableUpdate = false
+    // Game.UnityUpdate checks runner.DisableVariableUpdate BEFORE checking updateModeVariable.
     // If DisableVariableUpdate is true, it forces 1 tick/frame (speedup at >60 FPS).
     patch_handle_t runner_inst = get_runner_inst();
     if (runner_inst != PATCH_NULL) {
-        if (TimingManager::s_runner_pending_rate_field) {
-            bool pending = false;
-            patchlib_field_set_value(TimingManager::s_runner_pending_rate_field, runner_inst, &pending);
-        }
         if (TimingManager::s_runner_disable_var_field) {
             bool disable = false;
             patchlib_field_set_value(TimingManager::s_runner_disable_var_field, runner_inst, &disable);
         }
-        *reinterpret_cast<bool*>(reinterpret_cast<char*>(runner_inst) + 0xB0) = false; // PendingTargetSurfaceRate = false
-        *reinterpret_cast<bool*>(reinterpret_cast<char*>(runner_inst) + 0x2B) = false; // DisableVariableUpdate = false
     }
 
     if (instance != PATCH_NULL) {
@@ -257,26 +260,28 @@ static bool hook_Game_UnityUpdate_prefix(patch_handle_t instance, void** args,
             bool false_val = false;
             patchlib_field_set_value(TimingManager::s_game_high_fps_field, instance, &false_val);
         }
-        bool* highFrameRate = reinterpret_cast<bool*>(reinterpret_cast<char*>(instance) + 0x74);
-        *highFrameRate = false;
 
         // Force updateModeVariable = true so the vanilla 60 Hz accumulator loop is executed
         if (TimingManager::s_game_update_mode_var_field) {
             bool true_val = true;
             patchlib_field_set_value(TimingManager::s_game_update_mode_var_field, instance, &true_val);
         }
-        bool* updateModeVariable = reinterpret_cast<bool*>(reinterpret_cast<char*>(instance) + 0x53);
-        *updateModeVariable = true;
     }
 
-    // Guard: periodically verify and enforce VSync=0 and TargetFrameRate without spamming query -1
+    // Guard: periodically verify and enforce TargetFrameRate and runner surface rate without reflection or log spam
     ++s_frame_check_counter;
     if (s_frame_check_counter % 60 == 0) {
-        if (s_last_enforced_fps != g_config.target_fps) {
-            s_last_enforced_fps = g_config.target_fps;
-            LOGI("Game.UnityUpdate guard: applying target FPS %d", g_config.target_fps);
-            set_vsync_zero();
-            set_target_framerate(g_config.target_fps);
+        bool need_reapply = (s_last_enforced_fps != g_config.target_fps);
+        if (!need_reapply && runner_inst != PATCH_NULL && TimingManager::s_runner_target_rate_field != PATCH_NULL) {
+            float cur_surface_rate = 0.0f;
+            patchlib_field_get_value(TimingManager::s_runner_target_rate_field, runner_inst, &cur_surface_rate);
+            if (std::abs(cur_surface_rate - static_cast<float>(g_config.target_fps)) > 0.5f) {
+                need_reapply = true;
+            }
+        }
+        if (need_reapply) {
+            LOGI("Game.UnityUpdate guard: reapplying target FPS %d", g_config.target_fps);
+            TimingManager::apply_target_fps(g_config.target_fps);
         }
     }
 
@@ -292,27 +297,28 @@ static void hook_Game_UnityUpdate_postfix(patch_handle_t instance, void** args, 
             bool false_val = false;
             patchlib_field_set_value(TimingManager::s_game_high_fps_field, instance, &false_val);
         }
-        bool* highFrameRate = reinterpret_cast<bool*>(reinterpret_cast<char*>(instance) + 0x74);
-        *highFrameRate = false;
 
         if (TimingManager::s_game_update_mode_var_field) {
             bool true_val = true;
             patchlib_field_set_value(TimingManager::s_game_update_mode_var_field, instance, &true_val);
         }
-        bool* updateModeVariable = reinterpret_cast<bool*>(reinterpret_cast<char*>(instance) + 0x53);
-        *updateModeVariable = true;
     }
 
     patch_handle_t runner_inst = get_runner_inst();
     if (runner_inst != PATCH_NULL) {
-        *reinterpret_cast<bool*>(reinterpret_cast<char*>(runner_inst) + 0x2B) = false; // DisableVariableUpdate = false
-        *reinterpret_cast<bool*>(reinterpret_cast<char*>(runner_inst) + 0xB0) = false; // PendingTargetSurfaceRate = false
+        if (TimingManager::s_runner_disable_var_field) {
+            bool disable = false;
+            patchlib_field_set_value(TimingManager::s_runner_disable_var_field, runner_inst, &disable);
+        }
     }
 }
 
 // 2. Hook Main.DoUpdate for tick time and keyframe recording
 static bool hook_Main_DoUpdate_prefix(patch_handle_t instance, void** args,
                                       const patch_method_signature_t* sig_info, void* result) {
+    if (instance != PATCH_NULL && s_cached_game_inst == PATCH_NULL) {
+        s_cached_game_inst = instance;
+    }
     TimingManager::s_last_tick_time = std::chrono::steady_clock::now();
     InterpolationManager::begin_keyframe();
 
@@ -324,21 +330,35 @@ static bool hook_Main_DoUpdate_prefix(patch_handle_t instance, void** args,
             bool disable = false;
             patchlib_field_set_value(TimingManager::s_runner_disable_var_field, runner_inst, &disable);
         }
-        *reinterpret_cast<bool*>(reinterpret_cast<char*>(runner_inst) + 0x2B) = false;
     }
 
     return false; // Run original DoUpdate
 }
 
-// Intercept and block Android Surface rate modifications to prevent locking panel refresh rate
+// Intercept Android Surface rate modifications to ensure surface matches user target FPS
 static bool hook_XNAUnityRunner_SetAndroidSurfaceRate_prefix(patch_handle_t instance, void** args,
                                                             const patch_method_signature_t* sig_info, void* result) {
-    return true; // Skip original
+    if (instance != PATCH_NULL && s_cached_runner_inst == PATCH_NULL) {
+        s_cached_runner_inst = instance;
+    }
+    if (s_initial_fps_applied && args && args[0]) {
+        float* rate_ptr = reinterpret_cast<float*>(args[0]);
+        float target_fps_f = static_cast<float>(g_config.target_fps);
+        if (std::abs(*rate_ptr - target_fps_f) > 0.01f) {
+            LOGI("XNAUnityRunner.SetAndroidSurfaceRate(%.1f) intercepted -> changing argument to %.1f",
+                 *rate_ptr, target_fps_f);
+            *rate_ptr = target_fps_f;
+        }
+    }
+    return false; // Run original method with target_fps_f!
 }
 
 static bool hook_XNAUnityRunner_ApplyPendingSurfaceRate_prefix(patch_handle_t instance, void** args,
                                                               const patch_method_signature_t* sig_info, void* result) {
-    return true; // Skip original
+    if (instance != PATCH_NULL && s_cached_runner_inst == PATCH_NULL) {
+        s_cached_runner_inst = instance;
+    }
+    return false; // Run original method so surface rate is applied!
 }
 
 static void hook_Main_DoUpdate_postfix(patch_handle_t instance, void** args, void* result,
@@ -349,49 +369,60 @@ static void hook_Main_DoUpdate_postfix(patch_handle_t instance, void** args, voi
 // 3. Hook Main.SetPlatform60FPS to override vanilla 30/60 FPS locking
 static bool hook_Main_SetPlatform60FPS_prefix(patch_handle_t instance, void** args,
                                               const patch_method_signature_t* sig_info, void* result) {
-    LOGI("Main.SetPlatform60FPS intercepted -> enforcing target FPS: %d", g_config.target_fps);
-    TimingManager::apply_target_fps(g_config.target_fps);
-    return true; // Skip original to prevent vanilla 30/60 override
+    if (instance != PATCH_NULL && s_cached_game_inst == PATCH_NULL) {
+        s_cached_game_inst = instance;
+    }
+    if (s_initial_fps_applied) {
+        LOGI("Main.SetPlatform60FPS intercepted -> enforcing target FPS: %d", g_config.target_fps);
+        TimingManager::apply_target_fps(g_config.target_fps);
+        return true; // Skip original to prevent vanilla 30/60 override
+    }
+    return false; // Allow vanilla early boot setup to proceed untouched until s_initial_fps_applied is active
 }
 
 // 4. Hook Main.set_Setting_Target60FPS to override vanilla setting changes
 static bool hook_Main_set_Setting_Target60FPS_prefix(patch_handle_t instance, void** args,
                                                      const patch_method_signature_t* sig_info, void* result) {
-    LOGI("Main.set_Setting_Target60FPS intercepted -> enforcing target FPS: %d", g_config.target_fps);
-    TimingManager::apply_target_fps(g_config.target_fps);
-    return true; // Skip original
+    if (instance != PATCH_NULL && s_cached_game_inst == PATCH_NULL) {
+        s_cached_game_inst = instance;
+    }
+    if (s_initial_fps_applied) {
+        LOGI("Main.set_Setting_Target60FPS intercepted -> enforcing target FPS: %d", g_config.target_fps);
+        TimingManager::apply_target_fps(g_config.target_fps);
+        return true; // Skip original
+    }
+    return false; // Allow vanilla early boot setup to proceed untouched until s_initial_fps_applied is active
 }
 
 // 5. Hook XNAUnityRunner.Awake to apply target FPS once instance is ready
 static void hook_XNAUnityRunner_Awake_postfix(patch_handle_t instance, void** args, void* result,
                                               const patch_method_signature_t* sig_info) {
+    if (instance != PATCH_NULL) {
+        s_cached_runner_inst = instance;
+    }
     LOGI("XNAUnityRunner.Awake completed -> applying target FPS: %d", g_config.target_fps);
+    s_initial_fps_applied = true;
     TimingManager::apply_target_fps(g_config.target_fps);
 }
 
 // 6. Hook Main.LoadSettings to preserve user frame rate choice
 static void hook_Main_LoadSettings_postfix(patch_handle_t instance, void** args, void* result,
                                            const patch_method_signature_t* sig_info) {
-    LOGI("Main.LoadSettings completed -> reapplying target FPS: %d", g_config.target_fps);
-    TimingManager::apply_target_fps(g_config.target_fps);
-}
-
-// 7. Intercept QualitySettings.set_vSyncCount to prevent restoring VSync != 0
-static bool hook_QualitySettings_set_vSyncCount_prefix(patch_handle_t instance, void** args,
-                                                       const patch_method_signature_t* sig_info, void* result) {
-    if (args && args[0]) {
-        int* requested = reinterpret_cast<int*>(args[0]);
-        if (*requested != 0) {
-            LOGI("QualitySettings.set_vSyncCount(%d) intercepted -> changing argument to 0", *requested);
-            *requested = 0;
-        }
+    if (instance != PATCH_NULL && s_cached_game_inst == PATCH_NULL) {
+        s_cached_game_inst = instance;
     }
-    return false; // Allow original method to execute with value forced to 0
+    if (s_initial_fps_applied) {
+        LOGI("Main.LoadSettings completed -> reapplying target FPS: %d", g_config.target_fps);
+        TimingManager::apply_target_fps(g_config.target_fps);
+    }
 }
 
-// 8. Intercept Application.set_targetFrameRate to prevent lowering FPS
+// 7. Intercept Application.set_targetFrameRate to prevent lowering FPS
 static bool hook_Application_set_targetFrameRate_prefix(patch_handle_t instance, void** args,
                                                         const patch_method_signature_t* sig_info, void* result) {
+    if (!s_initial_fps_applied) {
+        return false; // Allow early Unity boot to proceed untouched
+    }
     if (args && args[0]) {
         int* requested = reinterpret_cast<int*>(args[0]);
         if (*requested != g_config.target_fps) {
@@ -407,7 +438,6 @@ bool TimingManager::init() {
     s_main_type = patchlib_type_get_type("Terraria", "Main");
     s_game_type = patchlib_type_get_type("Microsoft.Xna.Framework", "Game");
     s_app_type = patchlib_type_get_type("UnityEngine", "Application");
-    s_qs_type = patchlib_type_get_type("UnityEngine", "QualitySettings");
     s_runner_type = patchlib_type_get_type("", "XNAUnityRunner");
 
     if (!s_main_type || !s_game_type) {
@@ -415,66 +445,23 @@ bool TimingManager::init() {
         return false;
     }
 
-    // Resolve native Unity icalls
+    // Resolve native Unity Application.set_targetFrameRate icall
     void* resolve_sym = find_il2cpp_symbol("il2cpp_resolve_icall");
     if (resolve_sym) {
         s_il2cpp_resolve_icall = reinterpret_cast<il2cpp_resolve_icall_fn>(resolve_sym);
-
-        // QualitySettings.set_vSyncCount (internal calls are registered without parameter types)
-        s_set_vsync_icall = reinterpret_cast<set_vSyncCount_fn>(
-            s_il2cpp_resolve_icall("UnityEngine.QualitySettings::set_vSyncCount"));
-        if (!s_set_vsync_icall) {
-            s_set_vsync_icall = reinterpret_cast<set_vSyncCount_fn>(
-                s_il2cpp_resolve_icall("UnityEngine.QualitySettings::set_vSyncCount(System.Int32)"));
-        }
-
-        s_get_vsync_icall = reinterpret_cast<get_vSyncCount_fn>(
-            s_il2cpp_resolve_icall("UnityEngine.QualitySettings::get_vSyncCount"));
-        if (!s_get_vsync_icall) {
-            s_get_vsync_icall = reinterpret_cast<get_vSyncCount_fn>(
-                s_il2cpp_resolve_icall("UnityEngine.QualitySettings::get_vSyncCount()"));
-        }
-
-        // Application.set_targetFrameRate
         s_set_fps_icall = reinterpret_cast<set_targetFrameRate_fn>(
             s_il2cpp_resolve_icall("UnityEngine.Application::set_targetFrameRate"));
         if (!s_set_fps_icall) {
             s_set_fps_icall = reinterpret_cast<set_targetFrameRate_fn>(
                 s_il2cpp_resolve_icall("UnityEngine.Application::set_targetFrameRate(System.Int32)"));
         }
-
-        s_get_fps_icall = reinterpret_cast<get_targetFrameRate_fn>(
-            s_il2cpp_resolve_icall("UnityEngine.Application::get_targetFrameRate"));
-        if (!s_get_fps_icall) {
-            s_get_fps_icall = reinterpret_cast<get_targetFrameRate_fn>(
-                s_il2cpp_resolve_icall("UnityEngine.Application::get_targetFrameRate()"));
-        }
-
-        LOGI("Resolved Unity icalls: set_vSyncCount=%p, get_vSyncCount=%p, set_targetFrameRate=%p, get_targetFrameRate=%p",
-             s_set_vsync_icall, s_get_vsync_icall, s_set_fps_icall, s_get_fps_icall);
+        LOGI("Resolved Unity icalls: set_targetFrameRate=%p", s_set_fps_icall);
     }
 
-    // Resolve QualitySettings via patchlib
-    if (s_qs_type) {
-        s_set_vsync_method = patchlib_type_get_method_by_param_count(s_qs_type, "set_vSyncCount", 1);
-        s_get_vsync_method = patchlib_type_get_method_by_param_count(s_qs_type, "get_vSyncCount", 0);
-        LOGI("Found QualitySettings methods: set_vSyncCount=%p, get_vsyncCount=%p",
-             s_set_vsync_method, s_get_vsync_method);
-
-        if (s_set_vsync_method) {
-            patchlib_install_prepost_hook(s_set_vsync_method, hook_QualitySettings_set_vSyncCount_prefix, nullptr);
-            LOGI("Hooked QualitySettings.set_vSyncCount successfully");
-        }
-    } else {
-        LOGW("Failed to find UnityEngine.QualitySettings via patchlib");
-    }
-
-    // Resolve Application via patchlib
+    // Resolve UnityEngine.Application.set_targetFrameRate via patchlib
     if (s_app_type) {
         s_set_target_fps_method = patchlib_type_get_method_by_param_count(s_app_type, "set_targetFrameRate", 1);
-        s_get_target_fps_method = patchlib_type_get_method_by_param_count(s_app_type, "get_targetFrameRate", 0);
-        LOGI("Found Application methods: set_targetFrameRate=%p, get_targetFrameRate=%p",
-             s_set_target_fps_method, s_get_target_fps_method);
+        LOGI("Found Application methods: set_targetFrameRate=%p", s_set_target_fps_method);
 
         if (s_set_target_fps_method) {
             patchlib_install_prepost_hook(s_set_target_fps_method, hook_Application_set_targetFrameRate_prefix, nullptr);
@@ -485,12 +472,14 @@ bool TimingManager::init() {
     // Resolve Game fields
     s_game_high_fps_field = patchlib_type_get_field(s_game_type, "highFrameRate");
     s_game_update_mode_var_field = patchlib_type_get_field(s_game_type, "updateModeVariable");
-    LOGI("Found Game fields: highFrameRate=%p, updateModeVariable=%p",
-         s_game_high_fps_field, s_game_update_mode_var_field);
+    s_main_instance_field = patchlib_type_get_field(s_main_type, "instance");
+    LOGI("Found Game/Main fields: highFrameRate=%p, updateModeVariable=%p, instance=%p",
+         s_game_high_fps_field, s_game_update_mode_var_field, s_main_instance_field);
 
     // Resolve XNAUnityRunner
     if (s_runner_type) {
         s_runner_inst_field = patchlib_type_get_field(s_runner_type, "_instance");
+        s_runner_game_field = patchlib_type_get_field(s_runner_type, "_game");
         s_set_surface_rate_method = patchlib_type_get_method_by_param_count(s_runner_type, "SetAndroidSurfaceRate", 1);
         s_apply_surface_rate_method = patchlib_type_get_method_by_param_count(s_runner_type, "ApplyPendingSurfaceRate", 0);
 
@@ -500,11 +489,11 @@ bool TimingManager::init() {
 
         if (s_set_surface_rate_method) {
             patchlib_install_prepost_hook(s_set_surface_rate_method, hook_XNAUnityRunner_SetAndroidSurfaceRate_prefix, nullptr);
-            LOGI("Hooked XNAUnityRunner.SetAndroidSurfaceRate (blocked) successfully");
+            LOGI("Hooked XNAUnityRunner.SetAndroidSurfaceRate successfully");
         }
         if (s_apply_surface_rate_method) {
             patchlib_install_prepost_hook(s_apply_surface_rate_method, hook_XNAUnityRunner_ApplyPendingSurfaceRate_prefix, nullptr);
-            LOGI("Hooked XNAUnityRunner.ApplyPendingSurfaceRate (blocked) successfully");
+            LOGI("Hooked XNAUnityRunner.ApplyPendingSurfaceRate successfully");
         }
 
         patch_handle_t awake_method = patchlib_type_get_method_by_param_count(s_runner_type, "Awake", 0);
@@ -559,8 +548,9 @@ bool TimingManager::init() {
         LOGI("Hooked Main.LoadSettings successfully");
     }
 
-    // Initial apply
-    apply_target_fps(g_config.target_fps);
+    // Target FPS application is deferred to XNAUnityRunner.Awake (with Game.UnityUpdate fallback)
+    // to ensure Unity graphics and surface discovery are initialized safely.
+    LOGI("TimingManager initialized successfully (target FPS application deferred to Awake)");
 
     return true;
 }
@@ -570,44 +560,50 @@ void TimingManager::apply_target_fps(int fps) {
     LOGI("=== TimingManager::apply_target_fps(%d) ===", fps);
     s_last_enforced_fps = fps;
 
-    // 1. Force QualitySettings.vSyncCount = 0 so targetFrameRate is respected
-    set_vsync_zero();
-    LOGI("Applied QualitySettings.set_vSyncCount(0)");
-
-    // 2. Set UnityEngine.Application.targetFrameRate
+    // 1. Set UnityEngine.Application.targetFrameRate
     set_target_framerate(fps);
     LOGI("Applied Application.set_targetFrameRate(%d)", fps);
 
-    // 3. Ensure runner and game state maintain decoupled 60 TPS accumulator logic
+    // 2. Ensure runner and game state maintain decoupled 60 TPS accumulator logic
     patch_handle_t runner_inst = get_runner_inst();
     if (runner_inst != PATCH_NULL) {
-        // NEVER set surface rate or pending surface rate to avoid locking display panel refresh rate
-        if (s_runner_pending_rate_field) {
-            bool pending = false;
-            patchlib_field_set_value(s_runner_pending_rate_field, runner_inst, &pending);
+        float target_rate = static_cast<float>(fps);
+        if (s_runner_target_rate_field) {
+            patchlib_field_set_value(s_runner_target_rate_field, runner_inst, &target_rate);
+        }
+        if (s_set_surface_rate_method) {
+            void* rate_args[] = { &target_rate };
+            patchlib_method_invoke_args(s_set_surface_rate_method, runner_inst, nullptr, rate_args);
+            LOGI("Invoked XNAUnityRunner.SetAndroidSurfaceRate(%.1f)", target_rate);
+        }
+        if (s_apply_surface_rate_method) {
+            patchlib_method_invoke_args(s_apply_surface_rate_method, runner_inst, nullptr, nullptr);
+            LOGI("Invoked XNAUnityRunner.ApplyPendingSurfaceRate()");
         }
         if (s_runner_disable_var_field) {
             bool disable = false;
             patchlib_field_set_value(s_runner_disable_var_field, runner_inst, &disable);
         }
+    }
 
-        // Fallback offsets on runner
-        *reinterpret_cast<bool*>(reinterpret_cast<char*>(runner_inst) + 0xB0) = false; // PendingTargetSurfaceRate = false
-        *reinterpret_cast<bool*>(reinterpret_cast<char*>(runner_inst) + 0x2B) = false; // DisableVariableUpdate = false
-
-        void* game_ptr = *reinterpret_cast<void**>(reinterpret_cast<char*>(runner_inst) + 0x80);
-        if (game_ptr) {
-            if (s_game_high_fps_field) {
-                bool false_val = false;
-                patchlib_field_set_value(s_game_high_fps_field, game_ptr, &false_val);
-            }
-            *reinterpret_cast<bool*>(reinterpret_cast<char*>(game_ptr) + 0x74) = false; // highFrameRate = false
-
-            if (s_game_update_mode_var_field) {
-                bool true_val = true;
-                patchlib_field_set_value(s_game_update_mode_var_field, game_ptr, &true_val);
-            }
-            *reinterpret_cast<bool*>(reinterpret_cast<char*>(game_ptr) + 0x53) = true;  // updateModeVariable = true
+    patch_handle_t game_inst = PATCH_NULL;
+    if (s_cached_game_inst != PATCH_NULL) {
+        game_inst = s_cached_game_inst;
+    } else if (s_main_instance_field) {
+        patchlib_field_get_value(s_main_instance_field, PATCH_NULL, &game_inst);
+    }
+    if (game_inst == PATCH_NULL && runner_inst != PATCH_NULL && s_runner_game_field) {
+        patchlib_field_get_value(s_runner_game_field, runner_inst, &game_inst);
+    }
+    if (game_inst != PATCH_NULL) {
+        s_cached_game_inst = game_inst;
+        if (s_game_high_fps_field) {
+            bool false_val = false;
+            patchlib_field_set_value(s_game_high_fps_field, game_inst, &false_val);
+        }
+        if (s_game_update_mode_var_field) {
+            bool true_val = true;
+            patchlib_field_set_value(s_game_update_mode_var_field, game_inst, &true_val);
         }
     }
 }
@@ -621,8 +617,16 @@ bool TimingManager::is_game_paused() {
     return false;
 }
 
+bool TimingManager::should_bypass_interpolation() {
+    return g_config.target_fps <= 60;
+}
+
 float TimingManager::get_partial_tick() {
     if (is_game_paused()) {
+        return 1.0f;
+    }
+
+    if (should_bypass_interpolation()) {
         return 1.0f;
     }
 
@@ -631,7 +635,7 @@ float TimingManager::get_partial_tick() {
     float partial = static_cast<float>(elapsed_sec * 60.0);
 
     if (partial < 0.0f) partial = 0.0f;
-    if (partial > 1.0f) partial = 1.0f;
+    if (partial > 1.5f) partial = 1.5f;
 
     return partial;
 }

@@ -30,12 +30,6 @@ private:
     static patch_handle_t s_gore_field;
     static patch_handle_t s_item_field;
 
-    static patch_handle_t s_cached_player_arr;
-    static patch_handle_t s_cached_npc_arr;
-    static patch_handle_t s_cached_proj_arr;
-    static patch_handle_t s_cached_gore_arr;
-    static patch_handle_t s_cached_item_arr;
-
     static patch_handle_t get_player_array();
     static patch_handle_t get_npc_array();
     static patch_handle_t get_proj_array();

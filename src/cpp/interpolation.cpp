@@ -1,5 +1,6 @@
 #include "interpolation.hpp"
 #include "timing.hpp"
+#include "config.hpp"
 #include "log.hpp"
 #include "patchlib/field.h"
 #include "patchlib/method.h"
@@ -16,45 +17,44 @@ patch_handle_t InterpolationManager::s_projectile_field = PATCH_NULL;
 patch_handle_t InterpolationManager::s_gore_field = PATCH_NULL;
 patch_handle_t InterpolationManager::s_item_field = PATCH_NULL;
 
-patch_handle_t InterpolationManager::s_cached_player_arr = PATCH_NULL;
-patch_handle_t InterpolationManager::s_cached_npc_arr = PATCH_NULL;
-patch_handle_t InterpolationManager::s_cached_proj_arr = PATCH_NULL;
-patch_handle_t InterpolationManager::s_cached_gore_arr = PATCH_NULL;
-patch_handle_t InterpolationManager::s_cached_item_arr = PATCH_NULL;
-
 patch_handle_t InterpolationManager::get_player_array() {
-    if (s_cached_player_arr == PATCH_NULL && s_player_field) {
-        patchlib_field_get_value(s_player_field, PATCH_NULL, &s_cached_player_arr);
+    patch_handle_t arr = PATCH_NULL;
+    if (s_player_field) {
+        patchlib_field_get_value(s_player_field, PATCH_NULL, &arr);
     }
-    return s_cached_player_arr;
+    return arr;
 }
 
 patch_handle_t InterpolationManager::get_npc_array() {
-    if (s_cached_npc_arr == PATCH_NULL && s_npc_field) {
-        patchlib_field_get_value(s_npc_field, PATCH_NULL, &s_cached_npc_arr);
+    patch_handle_t arr = PATCH_NULL;
+    if (s_npc_field) {
+        patchlib_field_get_value(s_npc_field, PATCH_NULL, &arr);
     }
-    return s_cached_npc_arr;
+    return arr;
 }
 
 patch_handle_t InterpolationManager::get_proj_array() {
-    if (s_cached_proj_arr == PATCH_NULL && s_projectile_field) {
-        patchlib_field_get_value(s_projectile_field, PATCH_NULL, &s_cached_proj_arr);
+    patch_handle_t arr = PATCH_NULL;
+    if (s_projectile_field) {
+        patchlib_field_get_value(s_projectile_field, PATCH_NULL, &arr);
     }
-    return s_cached_proj_arr;
+    return arr;
 }
 
 patch_handle_t InterpolationManager::get_gore_array() {
-    if (s_cached_gore_arr == PATCH_NULL && s_gore_field) {
-        patchlib_field_get_value(s_gore_field, PATCH_NULL, &s_cached_gore_arr);
+    patch_handle_t arr = PATCH_NULL;
+    if (s_gore_field) {
+        patchlib_field_get_value(s_gore_field, PATCH_NULL, &arr);
     }
-    return s_cached_gore_arr;
+    return arr;
 }
 
 patch_handle_t InterpolationManager::get_item_array() {
-    if (s_cached_item_arr == PATCH_NULL && s_item_field) {
-        patchlib_field_get_value(s_item_field, PATCH_NULL, &s_cached_item_arr);
+    patch_handle_t arr = PATCH_NULL;
+    if (s_item_field) {
+        patchlib_field_get_value(s_item_field, PATCH_NULL, &arr);
     }
-    return s_cached_item_arr;
+    return arr;
 }
 
 // Camera motion interpolation:
@@ -150,6 +150,10 @@ static inline void** get_array_items(patch_handle_t arr_handle, size_t& count, s
     }
     const char* p = reinterpret_cast<const char*>(arr_handle);
     uint32_t len = *reinterpret_cast<const uint32_t*>(p + 0x18);
+    if (len == 0 || len > 50000) {
+        count = 0;
+        return nullptr;
+    }
     count = std::min(static_cast<size_t>(len), max_limit);
     return reinterpret_cast<void**>(const_cast<char*>(p + 0x20));
 }
@@ -163,256 +167,186 @@ void InterpolationManager::begin_keyframe() {
 
     // 1. Players
     patch_handle_t player_arr = get_player_array();
-    if (player_arr) {
-        size_t count = 0;
-        void** items = get_array_items(player_arr, count, MAX_PLAYERS);
-        if (items) {
-            for (size_t i = 0; i < count; ++i) {
-                void* obj = items[i];
-                if (!obj) {
-                    s_player_before[i].valid = false;
-                    continue;
-                }
-                char* p = reinterpret_cast<char*>(obj);
-                bool active = *reinterpret_cast<const bool*>(p + 0x49);
-                if (!active) {
-                    s_player_before[i].valid = false;
-                    continue;
-                }
+    size_t player_count = 0;
+    void** player_items = player_arr ? get_array_items(player_arr, player_count, MAX_PLAYERS) : nullptr;
+    for (size_t i = 0; i < MAX_PLAYERS; ++i) {
+        if (i < player_count && player_items && player_items[i]) {
+            char* p = reinterpret_cast<char*>(player_items[i]);
+            bool active = *reinterpret_cast<const bool*>(p + 0x49);
+            if (active) {
                 s_player_before[i].pos = *reinterpret_cast<const Vector2*>(p + 0x14);
                 s_player_before[i].item_loc = *reinterpret_cast<const Vector2*>(p + 0x4CC);
                 s_player_before[i].item_rot = *reinterpret_cast<const float*>(p + 0x4C8);
                 s_player_before[i].valid = true;
+                continue;
             }
         }
+        s_player_before[i].valid = false;
     }
 
     // 2. NPCs
     patch_handle_t npc_arr = get_npc_array();
-    if (npc_arr) {
-        size_t count = 0;
-        void** items = get_array_items(npc_arr, count, MAX_NPCS);
-        if (items) {
-            for (size_t i = 0; i < count; ++i) {
-                void* obj = items[i];
-                if (!obj) {
-                    s_npc_before[i].valid = false;
-                    continue;
-                }
-                char* p = reinterpret_cast<char*>(obj);
-                bool active = *reinterpret_cast<const bool*>(p + 0x49);
-                if (!active) {
-                    s_npc_before[i].valid = false;
-                    continue;
-                }
+    size_t npc_count = 0;
+    void** npc_items = npc_arr ? get_array_items(npc_arr, npc_count, MAX_NPCS) : nullptr;
+    for (size_t i = 0; i < MAX_NPCS; ++i) {
+        if (i < npc_count && npc_items && npc_items[i]) {
+            char* p = reinterpret_cast<char*>(npc_items[i]);
+            bool active = *reinterpret_cast<const bool*>(p + 0x49);
+            if (active) {
                 s_npc_before[i].pos = *reinterpret_cast<const Vector2*>(p + 0x14);
                 s_npc_before[i].rot = *reinterpret_cast<const float*>(p + 0x20C);
                 s_npc_before[i].valid = true;
+                continue;
             }
         }
+        s_npc_before[i].valid = false;
     }
 
     // 3. Projectiles
     patch_handle_t proj_arr = get_proj_array();
-    if (proj_arr) {
-        size_t count = 0;
-        void** items = get_array_items(proj_arr, count, MAX_PROJS);
-        if (items) {
-            for (size_t i = 0; i < count; ++i) {
-                void* obj = items[i];
-                if (!obj) {
-                    s_proj_before[i].valid = false;
-                    continue;
-                }
-                char* p = reinterpret_cast<char*>(obj);
-                bool active = *reinterpret_cast<const bool*>(p + 0x49);
-                if (!active) {
-                    s_proj_before[i].valid = false;
-                    continue;
-                }
+    size_t proj_count = 0;
+    void** proj_items = proj_arr ? get_array_items(proj_arr, proj_count, MAX_PROJS) : nullptr;
+    for (size_t i = 0; i < MAX_PROJS; ++i) {
+        if (i < proj_count && proj_items && proj_items[i]) {
+            char* p = reinterpret_cast<char*>(proj_items[i]);
+            bool active = *reinterpret_cast<const bool*>(p + 0x49);
+            if (active) {
                 s_proj_before[i].pos = *reinterpret_cast<const Vector2*>(p + 0x14);
                 s_proj_before[i].rot = *reinterpret_cast<const float*>(p + 0x60);
                 s_proj_before[i].valid = true;
+                continue;
             }
         }
+        s_proj_before[i].valid = false;
     }
 
     // 4. Gores
     patch_handle_t gore_arr = get_gore_array();
-    if (gore_arr) {
-        size_t count = 0;
-        void** items = get_array_items(gore_arr, count, MAX_GORES);
-        if (items) {
-            for (size_t i = 0; i < count; ++i) {
-                void* obj = items[i];
-                if (!obj) {
-                    s_gore_before[i].valid = false;
-                    continue;
-                }
-                char* p = reinterpret_cast<char*>(obj);
-                bool active = *reinterpret_cast<const bool*>(p + 0x34);
-                if (!active) {
-                    s_gore_before[i].valid = false;
-                    continue;
-                }
+    size_t gore_count = 0;
+    void** gore_items = gore_arr ? get_array_items(gore_arr, gore_count, MAX_GORES) : nullptr;
+    for (size_t i = 0; i < MAX_GORES; ++i) {
+        if (i < gore_count && gore_items && gore_items[i]) {
+            char* p = reinterpret_cast<char*>(gore_items[i]);
+            bool active = *reinterpret_cast<const bool*>(p + 0x34);
+            if (active) {
                 s_gore_before[i].pos = *reinterpret_cast<const Vector2*>(p + 0x10);
                 s_gore_before[i].rot = *reinterpret_cast<const float*>(p + 0x20);
                 s_gore_before[i].valid = true;
+                continue;
             }
         }
+        s_gore_before[i].valid = false;
     }
 
     // 5. Items
     patch_handle_t item_arr = get_item_array();
-    if (item_arr) {
-        size_t count = 0;
-        void** items = get_array_items(item_arr, count, MAX_ITEMS);
-        if (items) {
-            for (size_t i = 0; i < count; ++i) {
-                void* obj = items[i];
-                if (!obj) {
-                    s_item_before[i].valid = false;
-                    continue;
-                }
-                char* p = reinterpret_cast<char*>(obj);
-                int type = *reinterpret_cast<const int*>(p + 0x4C);
-                int stack = *reinterpret_cast<const int*>(p + 0x60);
-                if (type <= 0 || stack <= 0) {
-                    s_item_before[i].valid = false;
-                    continue;
-                }
+    size_t item_count = 0;
+    void** item_items = item_arr ? get_array_items(item_arr, item_count, MAX_ITEMS) : nullptr;
+    for (size_t i = 0; i < MAX_ITEMS; ++i) {
+        if (i < item_count && item_items && item_items[i]) {
+            char* p = reinterpret_cast<char*>(item_items[i]);
+            int type = *reinterpret_cast<const int*>(p + 0x4C);
+            int stack = *reinterpret_cast<const int*>(p + 0x60);
+            if (type > 0 && stack > 0) {
                 s_item_before[i].pos = *reinterpret_cast<const Vector2*>(p + 0x14);
                 s_item_before[i].valid = true;
+                continue;
             }
         }
+        s_item_before[i].valid = false;
     }
 }
 
 void InterpolationManager::end_keyframe() {
     // 1. Players
     patch_handle_t player_arr = get_player_array();
-    if (player_arr) {
-        size_t count = 0;
-        void** items = get_array_items(player_arr, count, MAX_PLAYERS);
-        if (items) {
-            for (size_t i = 0; i < count; ++i) {
-                void* obj = items[i];
-                if (!obj || !s_player_before[i].valid) {
-                    s_player_after[i].valid = false;
-                    continue;
-                }
-                char* p = reinterpret_cast<char*>(obj);
-                bool active = *reinterpret_cast<const bool*>(p + 0x49);
-                if (!active) {
-                    s_player_after[i].valid = false;
-                    continue;
-                }
+    size_t player_count = 0;
+    void** player_items = player_arr ? get_array_items(player_arr, player_count, MAX_PLAYERS) : nullptr;
+    for (size_t i = 0; i < MAX_PLAYERS; ++i) {
+        if (i < player_count && player_items && player_items[i] && s_player_before[i].valid) {
+            char* p = reinterpret_cast<char*>(player_items[i]);
+            bool active = *reinterpret_cast<const bool*>(p + 0x49);
+            if (active) {
                 s_player_after[i].pos = *reinterpret_cast<const Vector2*>(p + 0x14);
                 s_player_after[i].item_loc = *reinterpret_cast<const Vector2*>(p + 0x4CC);
                 s_player_after[i].item_rot = *reinterpret_cast<const float*>(p + 0x4C8);
                 s_player_after[i].valid = true;
+                continue;
             }
         }
+        s_player_after[i].valid = false;
     }
 
     // 2. NPCs
     patch_handle_t npc_arr = get_npc_array();
-    if (npc_arr) {
-        size_t count = 0;
-        void** items = get_array_items(npc_arr, count, MAX_NPCS);
-        if (items) {
-            for (size_t i = 0; i < count; ++i) {
-                void* obj = items[i];
-                if (!obj || !s_npc_before[i].valid) {
-                    s_npc_after[i].valid = false;
-                    continue;
-                }
-                char* p = reinterpret_cast<char*>(obj);
-                bool active = *reinterpret_cast<const bool*>(p + 0x49);
-                if (!active) {
-                    s_npc_after[i].valid = false;
-                    continue;
-                }
+    size_t npc_count = 0;
+    void** npc_items = npc_arr ? get_array_items(npc_arr, npc_count, MAX_NPCS) : nullptr;
+    for (size_t i = 0; i < MAX_NPCS; ++i) {
+        if (i < npc_count && npc_items && npc_items[i] && s_npc_before[i].valid) {
+            char* p = reinterpret_cast<char*>(npc_items[i]);
+            bool active = *reinterpret_cast<const bool*>(p + 0x49);
+            if (active) {
                 s_npc_after[i].pos = *reinterpret_cast<const Vector2*>(p + 0x14);
                 s_npc_after[i].rot = *reinterpret_cast<const float*>(p + 0x20C);
                 s_npc_after[i].valid = true;
+                continue;
             }
         }
+        s_npc_after[i].valid = false;
     }
 
     // 3. Projectiles
     patch_handle_t proj_arr = get_proj_array();
-    if (proj_arr) {
-        size_t count = 0;
-        void** items = get_array_items(proj_arr, count, MAX_PROJS);
-        if (items) {
-            for (size_t i = 0; i < count; ++i) {
-                void* obj = items[i];
-                if (!obj || !s_proj_before[i].valid) {
-                    s_proj_after[i].valid = false;
-                    continue;
-                }
-                char* p = reinterpret_cast<char*>(obj);
-                bool active = *reinterpret_cast<const bool*>(p + 0x49);
-                if (!active) {
-                    s_proj_after[i].valid = false;
-                    continue;
-                }
+    size_t proj_count = 0;
+    void** proj_items = proj_arr ? get_array_items(proj_arr, proj_count, MAX_PROJS) : nullptr;
+    for (size_t i = 0; i < MAX_PROJS; ++i) {
+        if (i < proj_count && proj_items && proj_items[i] && s_proj_before[i].valid) {
+            char* p = reinterpret_cast<char*>(proj_items[i]);
+            bool active = *reinterpret_cast<const bool*>(p + 0x49);
+            if (active) {
                 s_proj_after[i].pos = *reinterpret_cast<const Vector2*>(p + 0x14);
                 s_proj_after[i].rot = *reinterpret_cast<const float*>(p + 0x60);
                 s_proj_after[i].valid = true;
+                continue;
             }
         }
+        s_proj_after[i].valid = false;
     }
 
     // 4. Gores
     patch_handle_t gore_arr = get_gore_array();
-    if (gore_arr) {
-        size_t count = 0;
-        void** items = get_array_items(gore_arr, count, MAX_GORES);
-        if (items) {
-            for (size_t i = 0; i < count; ++i) {
-                void* obj = items[i];
-                if (!obj || !s_gore_before[i].valid) {
-                    s_gore_after[i].valid = false;
-                    continue;
-                }
-                char* p = reinterpret_cast<char*>(obj);
-                bool active = *reinterpret_cast<const bool*>(p + 0x34);
-                if (!active) {
-                    s_gore_after[i].valid = false;
-                    continue;
-                }
+    size_t gore_count = 0;
+    void** gore_items = gore_arr ? get_array_items(gore_arr, gore_count, MAX_GORES) : nullptr;
+    for (size_t i = 0; i < MAX_GORES; ++i) {
+        if (i < gore_count && gore_items && gore_items[i] && s_gore_before[i].valid) {
+            char* p = reinterpret_cast<char*>(gore_items[i]);
+            bool active = *reinterpret_cast<const bool*>(p + 0x34);
+            if (active) {
                 s_gore_after[i].pos = *reinterpret_cast<const Vector2*>(p + 0x10);
                 s_gore_after[i].rot = *reinterpret_cast<const float*>(p + 0x20);
                 s_gore_after[i].valid = true;
+                continue;
             }
         }
+        s_gore_after[i].valid = false;
     }
 
     // 5. Items
     patch_handle_t item_arr = get_item_array();
-    if (item_arr) {
-        size_t count = 0;
-        void** items = get_array_items(item_arr, count, MAX_ITEMS);
-        if (items) {
-            for (size_t i = 0; i < count; ++i) {
-                void* obj = items[i];
-                if (!obj || !s_item_before[i].valid) {
-                    s_item_after[i].valid = false;
-                    continue;
-                }
-                char* p = reinterpret_cast<char*>(obj);
-                int type = *reinterpret_cast<const int*>(p + 0x4C);
-                int stack = *reinterpret_cast<const int*>(p + 0x60);
-                if (type <= 0 || stack <= 0) {
-                    s_item_after[i].valid = false;
-                    continue;
-                }
+    size_t item_count = 0;
+    void** item_items = item_arr ? get_array_items(item_arr, item_count, MAX_ITEMS) : nullptr;
+    for (size_t i = 0; i < MAX_ITEMS; ++i) {
+        if (i < item_count && item_items && item_items[i] && s_item_before[i].valid) {
+            char* p = reinterpret_cast<char*>(item_items[i]);
+            int type = *reinterpret_cast<const int*>(p + 0x4C);
+            int stack = *reinterpret_cast<const int*>(p + 0x60);
+            if (type > 0 && stack > 0) {
                 s_item_after[i].pos = *reinterpret_cast<const Vector2*>(p + 0x14);
                 s_item_after[i].valid = true;
+                continue;
             }
         }
+        s_item_after[i].valid = false;
     }
 }
 
@@ -432,6 +366,8 @@ void InterpolationManager::apply_interpolation(float partial_tick) {
                 void* obj = items[i];
                 if (!obj) continue;
                 char* p = reinterpret_cast<char*>(obj);
+                bool active = *reinterpret_cast<const bool*>(p + 0x49);
+                if (!active) continue;
 
                 if (should_interpolate_pos(s_player_before[i].pos, s_player_after[i].pos)) {
                     *reinterpret_cast<Vector2*>(p + 0x14) = lerp_vec2(s_player_before[i].pos, s_player_after[i].pos, partial_tick);
@@ -453,6 +389,8 @@ void InterpolationManager::apply_interpolation(float partial_tick) {
                 void* obj = items[i];
                 if (!obj) continue;
                 char* p = reinterpret_cast<char*>(obj);
+                bool active = *reinterpret_cast<const bool*>(p + 0x49);
+                if (!active) continue;
 
                 if (should_interpolate_pos(s_npc_before[i].pos, s_npc_after[i].pos)) {
                     *reinterpret_cast<Vector2*>(p + 0x14) = lerp_vec2(s_npc_before[i].pos, s_npc_after[i].pos, partial_tick);
@@ -473,6 +411,8 @@ void InterpolationManager::apply_interpolation(float partial_tick) {
                 void* obj = items[i];
                 if (!obj) continue;
                 char* p = reinterpret_cast<char*>(obj);
+                bool active = *reinterpret_cast<const bool*>(p + 0x49);
+                if (!active) continue;
 
                 if (should_interpolate_pos(s_proj_before[i].pos, s_proj_after[i].pos)) {
                     *reinterpret_cast<Vector2*>(p + 0x14) = lerp_vec2(s_proj_before[i].pos, s_proj_after[i].pos, partial_tick);
@@ -493,6 +433,8 @@ void InterpolationManager::apply_interpolation(float partial_tick) {
                 void* obj = items[i];
                 if (!obj) continue;
                 char* p = reinterpret_cast<char*>(obj);
+                bool active = *reinterpret_cast<const bool*>(p + 0x34);
+                if (!active) continue;
 
                 if (should_interpolate_pos(s_gore_before[i].pos, s_gore_after[i].pos)) {
                     *reinterpret_cast<Vector2*>(p + 0x10) = lerp_vec2(s_gore_before[i].pos, s_gore_after[i].pos, partial_tick);
@@ -513,6 +455,9 @@ void InterpolationManager::apply_interpolation(float partial_tick) {
                 void* obj = items[i];
                 if (!obj) continue;
                 char* p = reinterpret_cast<char*>(obj);
+                int type = *reinterpret_cast<const int*>(p + 0x4C);
+                int stack = *reinterpret_cast<const int*>(p + 0x60);
+                if (type <= 0 || stack <= 0) continue;
 
                 if (should_interpolate_pos(s_item_before[i].pos, s_item_after[i].pos)) {
                     *reinterpret_cast<Vector2*>(p + 0x14) = lerp_vec2(s_item_before[i].pos, s_item_after[i].pos, partial_tick);
@@ -621,6 +566,9 @@ void InterpolationManager::restore() {
 
 static bool hook_Main_DoDraw_prefix(patch_handle_t instance, void** args,
                                    const patch_method_signature_t* sig_info, void* result) {
+    if (TimingManager::should_bypass_interpolation()) {
+        return false; // Direct render at current physics tick state; zero interpolation jitter
+    }
     float partial = TimingManager::get_partial_tick();
     InterpolationManager::apply_interpolation(partial);
     return false; // Run original DoDraw
@@ -628,6 +576,9 @@ static bool hook_Main_DoDraw_prefix(patch_handle_t instance, void** args,
 
 static void hook_Main_DoDraw_postfix(patch_handle_t instance, void** args, void* result,
                                     const patch_method_signature_t* sig_info) {
+    if (TimingManager::should_bypass_interpolation()) {
+        return;
+    }
     InterpolationManager::restore();
 }
 

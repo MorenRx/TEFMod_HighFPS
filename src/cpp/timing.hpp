@@ -14,6 +14,7 @@ public:
     static bool init();
     static void apply_target_fps(int fps);
     static float get_partial_tick();
+    static bool should_bypass_interpolation();
     static bool is_game_paused();
 
     static std::chrono::steady_clock::time_point s_last_tick_time;
@@ -22,14 +23,12 @@ public:
     static patch_handle_t s_game_type;
     static patch_handle_t s_app_type;
     static patch_handle_t s_runner_type;
-    static patch_handle_t s_qs_type;
 
     static patch_handle_t s_set_target_fps_method;
-    static patch_handle_t s_get_target_fps_method;
-    static patch_handle_t s_set_vsync_method;
-    static patch_handle_t s_get_vsync_method;
 
     static patch_handle_t s_runner_inst_field;
+    static patch_handle_t s_runner_game_field;
+    static patch_handle_t s_main_instance_field;
     static patch_handle_t s_set_surface_rate_method;
     static patch_handle_t s_apply_surface_rate_method;
     static patch_handle_t s_game_paused_field;

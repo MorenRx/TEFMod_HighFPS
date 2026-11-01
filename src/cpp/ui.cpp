@@ -17,52 +17,149 @@ constexpr int SETTING_ID_BATTERY_SAVING_MODE = 17; // GUISettingID.BatterySaving
 static patch_handle_t s_pulldown_type = PATCH_NULL;
 static patch_handle_t s_pulldown_inst = PATCH_NULL;
 static patch_handle_t s_pulldown_ctor = PATCH_NULL;
-static patch_handle_t s_pulldown_close_opts = PATCH_NULL;
 
 typedef uint32_t (*il2cpp_gchandle_new_fn)(void* obj, bool pinned);
+typedef void (*il2cpp_gchandle_free_fn)(uint32_t gchandle);
+
 static il2cpp_gchandle_new_fn s_il2cpp_gchandle_new = nullptr;
+static il2cpp_gchandle_free_fn s_il2cpp_gchandle_free = nullptr;
 
 static void init_gchandle() {
-    if (s_il2cpp_gchandle_new) return;
-    void* sym = find_il2cpp_symbol("il2cpp_gchandle_new");
-    if (sym) {
-        s_il2cpp_gchandle_new = reinterpret_cast<il2cpp_gchandle_new_fn>(sym);
-        LOGI("Found il2cpp_gchandle_new: %p", reinterpret_cast<void*>(s_il2cpp_gchandle_new));
-    } else {
-        LOGW("Failed to resolve il2cpp_gchandle_new");
+    if (s_il2cpp_gchandle_new && s_il2cpp_gchandle_free) return;
+    if (!s_il2cpp_gchandle_new) {
+        void* sym = find_il2cpp_symbol("il2cpp_gchandle_new");
+        if (sym) {
+            s_il2cpp_gchandle_new = reinterpret_cast<il2cpp_gchandle_new_fn>(sym);
+            LOGI("Found il2cpp_gchandle_new: %p", reinterpret_cast<void*>(s_il2cpp_gchandle_new));
+        } else {
+            LOGW("Failed to resolve il2cpp_gchandle_new");
+        }
+    }
+    if (!s_il2cpp_gchandle_free) {
+        void* sym = find_il2cpp_symbol("il2cpp_gchandle_free");
+        if (sym) {
+            s_il2cpp_gchandle_free = reinterpret_cast<il2cpp_gchandle_free_fn>(sym);
+            LOGI("Found il2cpp_gchandle_free: %p", reinterpret_cast<void*>(s_il2cpp_gchandle_free));
+        } else {
+            LOGW("Failed to resolve il2cpp_gchandle_free");
+        }
     }
 }
 
 static patch_handle_t s_pinned_fps_labels[ModConfig::FPS_COUNT] = { PATCH_NULL };
-static patch_handle_t s_pinned_title = PATCH_NULL;
+static uint32_t s_pinned_fps_gchandles[ModConfig::FPS_COUNT] = { 0 };
+static patch_handle_t s_vanilla_title = PATCH_NULL;
+static uint32_t s_vanilla_title_gchandle = 0;
+static patch_handle_t s_fallback_title = PATCH_NULL;
+static uint32_t s_fallback_title_gchandle = 0;
+static patch_handle_t s_empty_string = PATCH_NULL;
+static uint32_t s_empty_string_gchandle = 0;
+static patch_handle_t s_title_key_str = PATCH_NULL;
+static uint32_t s_title_key_gchandle = 0;
+static uint32_t s_pulldown_gchandle = 0;
 
-static patch_handle_t create_pinned_string(const char* str) {
+static patch_handle_t s_lang_type = PATCH_NULL;
+static patch_handle_t s_get_text_val = PATCH_NULL;
+static bool s_title_resolved = false;
+
+static patch_handle_t create_pinned_string(const char* str, uint32_t* out_gchandle = nullptr) {
     if (!str) return PATCH_NULL;
     patch_handle_t managed_str = patchlib_string_create(str);
     if (managed_str && s_il2cpp_gchandle_new) {
-        s_il2cpp_gchandle_new(managed_str, true);
+        uint32_t handle = s_il2cpp_gchandle_new(managed_str, false);
+        if (out_gchandle) {
+            *out_gchandle = handle;
+        }
     }
     return managed_str;
 }
 
-static void ensure_pinned_strings() {
+static patch_handle_t get_empty_string() {
+    if (s_empty_string == PATCH_NULL) {
+        init_gchandle();
+        s_empty_string = create_pinned_string("", &s_empty_string_gchandle);
+    }
+    return s_empty_string;
+}
+
+static patch_handle_t get_fallback_title() {
+    if (s_fallback_title == PATCH_NULL) {
+        init_gchandle();
+        s_fallback_title = create_pinned_string("Frame Rate Cap", &s_fallback_title_gchandle);
+    }
+    return s_fallback_title;
+}
+
+static patch_handle_t get_title_key_string() {
+    if (s_title_key_str == PATCH_NULL) {
+        init_gchandle();
+        s_title_key_str = create_pinned_string("Mobile.FrameRateCapTitle", &s_title_key_gchandle);
+    }
+    return s_title_key_str;
+}
+
+static void ensure_pinned_fps_labels() {
     init_gchandle();
-    bool all_valid = true;
     for (int i = 0; i < ModConfig::FPS_COUNT; ++i) {
-        if (!s_pinned_fps_labels[i]) {
-            s_pinned_fps_labels[i] = create_pinned_string(ModConfig::FPS_LABELS[i]);
-            if (!s_pinned_fps_labels[i]) all_valid = false;
+        if (s_pinned_fps_labels[i] == PATCH_NULL) {
+            s_pinned_fps_labels[i] = create_pinned_string(ModConfig::FPS_LABELS[i], &s_pinned_fps_gchandles[i]);
         }
     }
-    if (!s_pinned_title) {
-        s_pinned_title = create_pinned_string("Frame Rate Cap");
-        if (!s_pinned_title) all_valid = false;
+    if (s_fallback_title == PATCH_NULL) {
+        s_fallback_title = create_pinned_string("Frame Rate Cap", &s_fallback_title_gchandle);
     }
-    static bool s_logged = false;
-    if (all_valid && !s_logged) {
-        s_logged = true;
-        LOGI("Pre-created and pinned UI strings (0 managed allocations per frame)");
+    if (s_empty_string == PATCH_NULL) {
+        s_empty_string = create_pinned_string("", &s_empty_string_gchandle);
     }
+    if (s_title_key_str == PATCH_NULL) {
+        s_title_key_str = create_pinned_string("Mobile.FrameRateCapTitle", &s_title_key_gchandle);
+    }
+}
+
+static patch_handle_t get_vanilla_title() {
+    if (s_title_resolved) {
+        return s_vanilla_title;
+    }
+
+    s_title_resolved = true;
+    s_vanilla_title = PATCH_NULL;
+
+    // Dynamic retrieval from Terraria's official Language system:
+    // returns official localized text matching active game culture (zh-Hans: "最大帧率：", en-US: "Frame Rate Cap:", etc.)
+    if (!s_lang_type) {
+        s_lang_type = patchlib_type_get_type("Terraria.Localization", "Language");
+    }
+    if (s_lang_type) {
+        if (!s_get_text_val) {
+            s_get_text_val = patchlib_type_get_method_by_param_count(s_lang_type, "GetTextValue", 1);
+        }
+        if (s_get_text_val) {
+            patch_handle_t key_str = get_title_key_string();
+            if (key_str) {
+                void* args[1] = { &key_str };
+                patch_handle_t res_str = PATCH_NULL;
+                if (patchlib_method_invoke_args(s_get_text_val, PATCH_NULL, &res_str, args) && res_str) {
+                    init_gchandle();
+                    if (s_il2cpp_gchandle_new) {
+                        s_vanilla_title_gchandle = s_il2cpp_gchandle_new(res_str, false);
+                    }
+                    s_vanilla_title = res_str;
+                    return s_vanilla_title;
+                }
+            }
+        }
+    }
+
+    return s_vanilla_title;
+}
+
+static void invalidate_vanilla_title() {
+    if (s_il2cpp_gchandle_free && s_vanilla_title_gchandle != 0) {
+        s_il2cpp_gchandle_free(s_vanilla_title_gchandle);
+        s_vanilla_title_gchandle = 0;
+    }
+    s_vanilla_title = PATCH_NULL;
+    s_title_resolved = false;
 }
 
 static inline int get_setting_id(patch_handle_t instance) {
@@ -89,7 +186,7 @@ static bool hook_Pulldown_GetNumberOfOptions_prefix(patch_handle_t instance, voi
 static bool hook_Pulldown_GetOption_prefix(patch_handle_t instance, void** args,
                                            const patch_method_signature_t* sig_info, void* result) {
     if (get_setting_id(instance) == SETTING_ID_BATTERY_SAVING_MODE) {
-        ensure_pinned_strings();
+        ensure_pinned_fps_labels();
         int index = (args && args[0]) ? *reinterpret_cast<int*>(args[0]) : 1;
         patch_handle_t str_handle = PATCH_NULL;
         if (index >= 0 && index < ModConfig::FPS_COUNT) {
@@ -121,6 +218,12 @@ static bool hook_Pulldown_SetOption_prefix(patch_handle_t instance, void** args,
 
             // Update selectedPosition (offset 0x40 in GUIPulldownSetting)
             *reinterpret_cast<int*>(reinterpret_cast<char*>(instance) + 0x40) = index;
+            if (s_pulldown_inst != PATCH_NULL && s_pulldown_inst != instance) {
+                *reinterpret_cast<int*>(reinterpret_cast<char*>(s_pulldown_inst) + 0x40) = index;
+            }
+            // Note: GUIPulldownSetting.Draw() manages its own closing and picking interceptor cleanup.
+            // Do NOT call CloseOptions here as it unregisters _pickingInterceptor early and sets it to NULL,
+            // which causes Draw() to pass NULL to UnregisterPickingInterceptor and crash with SIGSEGV (fault addr 0x4).
         }
         return true; // Skip original
     }
@@ -131,7 +234,7 @@ static bool hook_Pulldown_SetOption_prefix(patch_handle_t instance, void** args,
 static bool hook_Pulldown_GetValue_prefix(patch_handle_t instance, void** args,
                                           const patch_method_signature_t* sig_info, void* result) {
     if (get_setting_id(instance) == SETTING_ID_BATTERY_SAVING_MODE) {
-        ensure_pinned_strings();
+        ensure_pinned_fps_labels();
         int idx = g_config.get_fps_index();
         patch_handle_t str_handle = PATCH_NULL;
         if (idx >= 0 && idx < ModConfig::FPS_COUNT) {
@@ -153,13 +256,15 @@ static bool hook_Pulldown_GetValue_prefix(patch_handle_t instance, void** args,
 static bool hook_Pulldown_GetTitle_prefix(patch_handle_t instance, void** args,
                                           const patch_method_signature_t* sig_info, void* result) {
     if (get_setting_id(instance) == SETTING_ID_BATTERY_SAVING_MODE) {
-        ensure_pinned_strings();
-        patch_handle_t str_handle = s_pinned_title;
+        patch_handle_t str_handle = get_vanilla_title();
         if (!str_handle) {
-            str_handle = patchlib_string_create("Frame Rate Cap");
+            str_handle = get_fallback_title();
+        }
+        if (!str_handle) {
+            str_handle = get_empty_string();
         }
         *reinterpret_cast<patch_handle_t*>(result) = str_handle;
-        return true; // Skip original
+        return true; // Skip original (vanilla GUIPulldownSetting has no case 17 and returns NULL)
     }
     return false;
 }
@@ -179,7 +284,7 @@ static bool hook_Pulldown_OptionDisabled_prefix(patch_handle_t instance, void** 
 // ==============================================================================
 
 static inline patch_handle_t get_current_toggle_label() {
-    ensure_pinned_strings();
+    ensure_pinned_fps_labels();
     int idx = g_config.get_fps_index();
     patch_handle_t str_handle = PATCH_NULL;
     if (idx >= 0 && idx < ModConfig::FPS_COUNT) {
@@ -192,15 +297,6 @@ static inline patch_handle_t get_current_toggle_label() {
         str_handle = patchlib_string_create(g_config.get_fps_label());
     }
     return str_handle;
-}
-
-static bool hook_Toggle_GetOption_prefix(patch_handle_t instance, void** args,
-                                         const patch_method_signature_t* sig_info, void* result) {
-    if (get_setting_id(instance) == SETTING_ID_BATTERY_SAVING_MODE) {
-        *reinterpret_cast<patch_handle_t*>(result) = get_current_toggle_label();
-        return true;
-    }
-    return false;
 }
 
 static bool hook_Toggle_GetOptionOn_prefix(patch_handle_t instance, void** args,
@@ -234,6 +330,7 @@ static bool hook_Toggle_Toggle_prefix(patch_handle_t instance, void** args,
                                       const patch_method_signature_t* sig_info, void* result) {
     if (get_setting_id(instance) == SETTING_ID_BATTERY_SAVING_MODE) {
         g_config.cycle_fps();
+        g_config.save();
         LOGI("Frame Rate Cap toggled -> new setting: %s (%d FPS)",
              g_config.get_fps_label(), g_config.target_fps);
         TimingManager::apply_target_fps(g_config.target_fps);
@@ -266,25 +363,25 @@ static void replace_entry_in_list(void* list_obj) {
                 }
             }
         }
-    }
+    } else {
+        // 2. Direct memory layout fallback for Il2Cpp List<T>
+        void* items_ptr = *reinterpret_cast<void**>(reinterpret_cast<char*>(list_obj) + 0x10);
+        int size = *reinterpret_cast<int*>(reinterpret_cast<char*>(list_obj) + 0x18);
+        if (items_ptr && size > 0 && size < 10000) {
+            void** items = reinterpret_cast<void**>(reinterpret_cast<char*>(items_ptr) + 0x20);
+            for (int i = 0; i < size; ++i) {
+                void* entry = items[i];
+                if (entry && get_setting_id(entry) == SETTING_ID_BATTERY_SAVING_MODE) {
+                    if (entry != s_pulldown_inst) {
+                        // Inherit category (0x18) and sortId (0x14) from original entry
+                        *reinterpret_cast<int*>(reinterpret_cast<char*>(s_pulldown_inst) + 0x14) =
+                            *reinterpret_cast<const int*>(reinterpret_cast<const char*>(entry) + 0x14);
+                        *reinterpret_cast<int*>(reinterpret_cast<char*>(s_pulldown_inst) + 0x18) =
+                            *reinterpret_cast<const int*>(reinterpret_cast<const char*>(entry) + 0x18);
 
-    // 2. Direct memory layout fallback for Il2Cpp List<T>
-    void* items_ptr = *reinterpret_cast<void**>(reinterpret_cast<char*>(list_obj) + 0x10);
-    int size = *reinterpret_cast<int*>(reinterpret_cast<char*>(list_obj) + 0x18);
-    if (items_ptr && size > 0) {
-        void** items = reinterpret_cast<void**>(reinterpret_cast<char*>(items_ptr) + 0x20);
-        for (int i = 0; i < size; ++i) {
-            void* entry = items[i];
-            if (entry && get_setting_id(entry) == SETTING_ID_BATTERY_SAVING_MODE) {
-                if (entry != s_pulldown_inst) {
-                    // Inherit category (0x18) and sortId (0x14) from original entry
-                    *reinterpret_cast<int*>(reinterpret_cast<char*>(s_pulldown_inst) + 0x14) =
-                        *reinterpret_cast<const int*>(reinterpret_cast<const char*>(entry) + 0x14);
-                    *reinterpret_cast<int*>(reinterpret_cast<char*>(s_pulldown_inst) + 0x18) =
-                        *reinterpret_cast<const int*>(reinterpret_cast<const char*>(entry) + 0x18);
-
-                    items[i] = s_pulldown_inst;
-                    LOGI("Replaced BatterySavingMode entry with GUIPulldownSetting via direct memory at index %d", i);
+                        items[i] = s_pulldown_inst;
+                        LOGI("Replaced BatterySavingMode entry with GUIPulldownSetting via direct memory at index %d", i);
+                    }
                 }
             }
         }
@@ -300,8 +397,8 @@ static void ensure_pulldown_setting(patch_handle_t overlay_inst) {
         if (s_pulldown_inst) {
             init_gchandle();
             if (s_il2cpp_gchandle_new) {
-                s_il2cpp_gchandle_new(s_pulldown_inst, true);
-                LOGI("Pinned GUIPulldownSetting instance with GC handle: %p", s_pulldown_inst);
+                s_pulldown_gchandle = s_il2cpp_gchandle_new(s_pulldown_inst, false);
+                LOGI("Retained GUIPulldownSetting instance with normal GC handle: %p (handle=%u)", s_pulldown_inst, s_pulldown_gchandle);
             }
             int id = SETTING_ID_BATTERY_SAVING_MODE;
             void* null_cb = nullptr;
@@ -328,6 +425,7 @@ static void ensure_pulldown_setting(patch_handle_t overlay_inst) {
 static void hook_GUISettingsOverlay_Init_postfix(patch_handle_t instance, void** args, void* result,
                                                  const patch_method_signature_t* sig_info) {
     LOGI("GUISettingsOverlay.Init finished -> ensuring Pulldown setting is active");
+    invalidate_vanilla_title();
     ensure_pulldown_setting(instance);
 }
 
@@ -337,10 +435,10 @@ static bool hook_GUISettingsOverlay_SetCategory_prefix(patch_handle_t instance, 
     return false; // Continue original SetCategory
 }
 
-static bool hook_GUISettingsOverlay_Draw_prefix(patch_handle_t instance, void** args,
-                                                const patch_method_signature_t* sig_info, void* result) {
+static void hook_GUISettingsOverlay_SetCategory_postfix(patch_handle_t instance, void** args, void* result,
+                                                        const patch_method_signature_t* sig_info) {
+    invalidate_vanilla_title();
     ensure_pulldown_setting(instance);
-    return false; // Continue original Draw
 }
 
 bool UIManager::init() {
@@ -348,7 +446,6 @@ bool UIManager::init() {
     s_pulldown_type = patchlib_type_get_type("", "GUIPulldownSetting");
     if (s_pulldown_type) {
         s_pulldown_ctor = patchlib_type_get_method_by_param_count(s_pulldown_type, ".ctor", 4);
-        s_pulldown_close_opts = patchlib_type_get_method_by_param_count(s_pulldown_type, "CloseOptions", 0);
 
         patch_handle_t get_num_opts = patchlib_type_get_method_by_param_count(s_pulldown_type, "GetNumberOfOptions", 0);
         if (get_num_opts) {
@@ -400,27 +497,18 @@ bool UIManager::init() {
 
         patch_handle_t set_cat = patchlib_type_get_method_by_param_count(overlay_type, "SetCategory", 1);
         if (set_cat) {
-            patchlib_install_prepost_hook(set_cat, hook_GUISettingsOverlay_SetCategory_prefix, nullptr);
-            LOGI("Hooked GUISettingsOverlay.SetCategory");
+            patchlib_install_prepost_hook(set_cat, hook_GUISettingsOverlay_SetCategory_prefix, hook_GUISettingsOverlay_SetCategory_postfix);
+            LOGI("Hooked GUISettingsOverlay.SetCategory (pre+post)");
         }
-
-        patch_handle_t draw_m = patchlib_type_get_method_by_param_count(overlay_type, "Draw", 0);
-        if (draw_m) {
-            patchlib_install_prepost_hook(draw_m, hook_GUISettingsOverlay_Draw_prefix, nullptr);
-            LOGI("Hooked GUISettingsOverlay.Draw");
-        }
+        // Do NOT hook GUISettingsOverlay.Draw: modifying settings lists during rendering causes race conditions,
+        // and hooking a no-op method introduces unnecessary per-frame libffi overhead.
     } else {
         LOGW("Failed to resolve GUISettingsOverlay type");
     }
 
-    // 3. Fallback: Hook GUIToggleSetting methods
+    // 3. Fallback: Hook GUIToggleSetting methods (GetOption is NOT hooked to preserve vanilla title naturally)
     patch_handle_t toggle_setting_type = patchlib_type_get_type("", "GUIToggleSetting");
     if (toggle_setting_type) {
-        patch_handle_t get_option = patchlib_type_get_method_by_param_count(toggle_setting_type, "GetOption", 0);
-        if (get_option) {
-            patchlib_install_prepost_hook(get_option, hook_Toggle_GetOption_prefix, nullptr);
-        }
-
         patch_handle_t get_option_on = patchlib_type_get_method_by_param_count(toggle_setting_type, "GetOptionOn", 0);
         if (get_option_on) {
             patchlib_install_prepost_hook(get_option_on, hook_Toggle_GetOptionOn_prefix, nullptr);
@@ -442,7 +530,7 @@ bool UIManager::init() {
         }
     }
 
-    ensure_pinned_strings();
+    ensure_pinned_fps_labels();
     return true;
 }
 
